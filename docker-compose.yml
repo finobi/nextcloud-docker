@@ -1,0 +1,158 @@
+services:
+  reverse-proxy:
+    image: traefik:3.4.1
+    # Enables the web UI and tells Traefik to listen to docker
+    command:
+      - --api.insecure # For diagnose, can be removed
+      - --providers.docker
+      - --providers.docker.exposedbydefault=false
+      - --entryPoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entryPoints.websecure.address=:443
+      - --entrypoints.websecure.http.tls=true
+      - --entrypoints.websecure.http.tls.domains[0].main= your-nextcloud-domain-here
+      - --entrypoints.websecure.http.tls.domains[0].sans= your-collabora-domain-here
+      - --certificatesresolvers.cloudflare.acme.dnschallenge=true
+      - --certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare
+      - --certificatesresolvers.cloudflare.acme.storage=/etc/traefik/acme.json
+    ports:
+      - 80:80
+      - 8080:8080   # Traefik dashboard, for diagnose can be disabled
+      - 443:443
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /data/docker/traefik/logs:/logs
+      - /data/docker/traefik/acme.json:/etc/traefik/acme.json
+    env_file:
+      - ./secrets/cloudflare_traefik.env
+      # Put these lines into .env file, you need to generate API key from Cloudflare
+      # CF_API_EMAIL=
+      # CF_DNS_API_TOKEN=
+    networks:
+      - nextcloud-backend
+      - collabora-backend
+    restart: always
+  nextcloud-db:
+    image: mariadb:10.6
+    restart: always
+    command: --transaction-isolation=READ-COMMITTED --log-bin=binlog --binlog-format=ROW
+    volumes:
+      - /data/docker/nextcloud-db:/var/lib/mysql
+    env_file:
+      - ./secrets/nextcloud-db.env
+      # Put these lines into .env file
+      # MYSQL_ROOT_PASSWORD= # Generate secure password
+      # MYSQL_PASSWORD= # Generate secure password
+      # MYSQL_DATABASE=nextcloud
+      # MYSQL_USER=nextcloud
+      # REDIS_HOST=nextcloud-redis
+    ports:
+      - 3306:3306
+    networks:
+      - nextcloud-backend
+  nextcloud-redis:
+    image: redis
+    restart: always
+    networks:
+      - nextcloud-backend
+    volumes:
+      - /data/docker/redis:/data
+    command:
+      - /bin/sh
+      - -c
+      - redis-server --requirepass '[Generate secure password here]'
+  nextcloud:
+    image: nextcloud
+    restart: always
+    links:
+      - nextcloud-db
+      - nextcloud-redis
+    volumes:
+      - /data/docker/nextcloud:/var/www/html
+      - /data/shares/nextcloud:/var/www/html/data
+    env_file:
+      - ./secrets/nextcloud-db.env
+      # Same env file as nextcloud-bd
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.nextcloud.rule=Host(`your-nextcloud-domain-here`)
+      - traefik.http.routers.nextcloud.service=nextcloud
+      - traefik.http.routers.nextcloud.entrypoints=websecure
+      - traefik.http.services.nextcloud.loadbalancer.server.port=80
+      - traefik.http.routers.nextcloud.tls=true
+      - traefik.http.routers.nextcloud.tls.certresolver=cloudflare
+      - traefik.http.services.nextcloud.loadbalancer.passhostheader=true
+      - traefik.docker.network=nextcloud-backend
+      - traefik.http.services.nextcloud.loadbalancer.server.scheme=http
+      - traefik.http.routers.nextcloud.middlewares=nextcloud_redirectregex,compresstraefik,nc-security
+      - traefik.http.middlewares.nextcloud_redirectregex.redirectregex.permanent=true
+      - traefik.http.middlewares.nextcloud_redirectregex.redirectregex.regex=https://(.*)/.well-known/(card|cal)dav
+      - traefik.http.middlewares.nextcloud_redirectregex.redirectregex.replacement=https://$$1/remote.php/dav/
+      - traefik.http.middlewares.compresstraefik.compress=true
+      - traefik.http.middlewares.nc-security.headers.customFrameOptionsValue=SAMEORIGIN
+      - traefik.http.middlewares.nc-security.headers.framedeny=true
+      - traefik.http.middlewares.nc-security.headers.sslredirect=true
+      - traefik.http.middlewares.nc-security.headers.STSIncludeSubdomains=true
+      - traefik.http.middlewares.nc-security.headers.STSPreload=true
+      - traefik.http.middlewares.nc-security.headers.STSSeconds=315360000
+      - traefik.http.middlewares.nc-security.headers.forceSTSHeader=true
+      - traefik.http.middlewares.nc-security.headers.sslProxyHeaders.X-Forwarded-Proto=https
+    networks:
+      - nextcloud-backend
+  collabora:
+    image: collabora/code:latest
+    restart: always
+    cap_add:
+      - MKNOD
+    env_file:
+      - ./secrets/collabora.env
+      # Put these lines into .env file
+      # username=
+      # password=
+    environment:
+      - domain=your-collabora-domain-here
+      - /data/docker/collabora:/config
+      - extra_params=--o:ssl.enable=false --o:ssl.termination=true
+    ports:
+      - "9980:9980"
+    networks:
+     - collabora-backend
+     - nextcloud-backend
+    labels:
+     - traefik.enable=true
+     - traefik.http.routers.collabora.service=collabora
+     - traefik.http.routers.collabora.rule=Host(`your-collabora-domain-here`)
+     - traefik.http.routers.collabora.entrypoints=websecure
+     - traefik.http.routers.collabora.middlewares=collabora
+     - traefik.http.services.collabora.loadbalancer.server.port=9980
+     - traefik.http.routers.collabora.tls.certresolver=cloudflare
+     - traefik.http.middlewares.collabora.redirectscheme.scheme=https
+     - traefik.http.middlewares.collabora.redirectscheme.permanent=true
+     - traefik.http.services.collabora.loadbalancer.passhostheader=true
+     - traefik.docker.network=collabora-backend
+  cloudflare-ddns:
+    image: favonia/cloudflare-ddns:latest
+    restart: always
+    env_file:
+      - ./secrets/cloudflare_ddns.env
+      # Put this into .env file
+      # CLOUDFLARE_API_TOKEN=
+    environment:
+      - DOMAINS=your-nextcloud-domain-here
+      - PROXIED=false
+      - INTERFACE=enp2s0 # This was my DMZ interface which IP I wanted to be written into DNS
+    network_mode: host
+  cloudflare-ddns-collabora:
+    image: favonia/cloudflare-ddns:latest
+    restart: always
+    env_file:
+      - ./secrets/cloudflare_ddns.env
+    environment:
+      - DOMAINS=your-collabora-domain-here
+      - PROXIED=false
+      - INTERFACE=enp2s0 # This was my DMZ interface which IP I wanted to be written into DNS
+    network_mode: host
+networks:
+  nextcloud-backend:
+  collabora-backend:
+
